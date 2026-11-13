@@ -81,6 +81,7 @@
 **Features**
 
 -   Improved text layout and shaping (#246, #2713, #2988, #3053, #3543, #3625)
+-   Add variable font support to `sf::Font`: enumerate variation axes and named instances, set design coordinates, and cache glyphs, metrics, kerning, HarfBuzz shaping and glyph atlases per axis value
 -   Enable range based looping of `sf::VertexArray` (#3366)
 -   Added support for making OpenGL errors fatal (#3468)
 -   Add support for QOI image format (#3554, #3700)

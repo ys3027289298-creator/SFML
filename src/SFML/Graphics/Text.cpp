@@ -196,14 +196,20 @@ struct Text::ShaperImpl
     // FreeType face and a specific character size
     // If we need to shape text using another font or another
     // character size we will have to create a new shaper
-    ShaperImpl(void* fontHandle, std::uint64_t theFontId, unsigned int theCharacterSize) :
+    ShaperImpl(void* fontHandle, std::uint64_t theFontId, unsigned int theCharacterSize, std::vector<hb_variation_t> theVariations) :
         fontId(theFontId),
         characterSize(theCharacterSize),
+        variations(std::move(theVariations)),
         shaper(hb_ft_font_create(static_cast<FT_Face>(fontHandle), nullptr)),
         shapingBuffer(hb_buffer_create())
     {
         // Make HarfBuzz use FreeType font functions
         hb_ft_font_set_funcs(shaper.get());
+
+        // Apply the variation coordinates so that shaping uses the
+        // same axis values that are used to rasterize the glyphs
+        if (!variations.empty())
+            hb_font_set_variations(shaper.get(), variations.data(), static_cast<unsigned int>(variations.size()));
     }
 
     // To save on memory, instead of every sf::Text object having
@@ -214,7 +220,10 @@ struct Text::ShaperImpl
     // from multiple sf::Text objects we have to guard both the
     // shaper cache and the shaper objects (which contain buffers)
     // themselves using mutexes
-    static std::shared_ptr<ShaperImpl> getShaper(void* fontHandle, std::uint64_t fontId, unsigned int characterSize)
+    static std::shared_ptr<ShaperImpl> getShaper(void*                       fontHandle,
+                                                 std::uint64_t               fontId,
+                                                 unsigned int                characterSize,
+                                                 std::vector<hb_variation_t> variations)
     {
         // Our shaper cache
         struct ShaperCache
@@ -238,7 +247,13 @@ struct Text::ShaperImpl
             }
             else
             {
-                if (shaper->fontId == fontId && shaper->characterSize == characterSize)
+                const bool variationsMatch = shaper->variations.size() == variations.size() &&
+                                             std::equal(shaper->variations.begin(),
+                                                        shaper->variations.end(),
+                                                        variations.begin(),
+                                                        [](const hb_variation_t& lhs, const hb_variation_t& rhs)
+                                                        { return lhs.tag == rhs.tag && lhs.value == rhs.value; });
+                if (shaper->fontId == fontId && shaper->characterSize == characterSize && variationsMatch)
                     result = std::move(shaper);
 
                 // Don't break even if we find a match since we want to finish cleaning up
@@ -249,7 +264,7 @@ struct Text::ShaperImpl
         if (!result)
         {
             // We didn't find a cached shaper, create a new one
-            result = std::make_shared<ShaperImpl>(fontHandle, fontId, characterSize);
+            result = std::make_shared<ShaperImpl>(fontHandle, fontId, characterSize, std::move(variations));
             shaperCache.cache.emplace_back(result);
         }
 
@@ -391,11 +406,12 @@ struct Text::ShaperImpl
         }
     };
 
-    std::mutex                                        mutex;           //!< Mutex guarding our shaper and shaping buffer
-    const std::uint64_t                               fontId{};        //!< Font ID this shaper is linked to
-    const unsigned int                                characterSize{}; //!< Character size this shaper was created with
-    std::unique_ptr<hb_font_t, ShaperDeleter>         shaper;          //!< Our shaper
-    std::unique_ptr<hb_buffer_t, ShaperBufferDeleter> shapingBuffer;   //!< The buffer to perform shaping with
+    std::mutex                                mutex;           //!< Mutex guarding our shaper and shaping buffer
+    const std::uint64_t                       fontId{};        //!< Font ID this shaper is linked to
+    const unsigned int                        characterSize{}; //!< Character size this shaper was created with
+    const std::vector<hb_variation_t>         variations;      //!< Variation coordinates this shaper was created with
+    std::unique_ptr<hb_font_t, ShaperDeleter> shaper;          //!< Our shaper
+    std::unique_ptr<hb_buffer_t, ShaperBufferDeleter> shapingBuffer; //!< The buffer to perform shaping with
 };
 
 
@@ -815,6 +831,14 @@ void Text::ensureGeometryUpdate() const
         return;
     }
 
+    // Snapshot the active variation coordinates; the shaper cache is keyed
+    // on them so switching axes never reshapes text with stale coordinates
+    const auto                  fontAxisValues = m_font->getAxisVariationsForShaping();
+    std::vector<hb_variation_t> variations;
+    variations.reserve(fontAxisValues.size());
+    for (const auto& [tag, value] : fontAxisValues)
+        variations.push_back({static_cast<hb_tag_t>(tag), value});
+
     // Shaping only supports single lines, we will need to
     // break multi-line strings into individual lines ourselves
     sf::String                 currentLine;
@@ -825,10 +849,16 @@ void Text::ensureGeometryUpdate() const
 
     const auto outputLine = [&]
     {
-        if (!m_shaper || m_shaper->fontId != fontId || m_shaper->characterSize != m_characterSize)
+        const auto variationsMatch = m_shaper && m_shaper->variations.size() == variations.size() &&
+                                     std::equal(m_shaper->variations.begin(),
+                                                m_shaper->variations.end(),
+                                                variations.begin(),
+                                                [](const hb_variation_t& lhs, const hb_variation_t& rhs)
+                                                { return lhs.tag == rhs.tag && lhs.value == rhs.value; });
+        if (!m_shaper || m_shaper->fontId != fontId || m_shaper->characterSize != m_characterSize || !variationsMatch)
         {
             // We need to get a new shaper implementation
-            m_shaper = ShaperImpl::getShaper(fontHandle, fontId, m_characterSize);
+            m_shaper = ShaperImpl::getShaper(fontHandle, fontId, m_characterSize, variations);
         }
 
         const auto shapeOutput = m_shaper->shape(currentLine,

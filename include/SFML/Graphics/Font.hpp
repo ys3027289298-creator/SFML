@@ -37,9 +37,11 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <cstddef>
@@ -57,6 +59,35 @@ class InputStream;
 class SFML_GRAPHICS_API Font
 {
 public:
+    ////////////////////////////////////////////////////////////
+    /// \brief Holds information about a variation axis of a variable font
+    ///
+    /// A variation axis is identified by a four-character tag such as
+    /// `wght` (weight), `wdth` (width) or `slnt` (slant). The minimum,
+    /// default and maximum values are design coordinates expressed as
+    /// plain floats, matching the values passed to
+    /// `setVariableAxisValue`.
+    ///
+    ////////////////////////////////////////////////////////////
+    struct VariableAxis
+    {
+        std::uint32_t tag{};          //!< Four-character axis tag (packed as a 32-bit integer)
+        std::string   name;           //!< Human readable name of the axis
+        float         minimum{};      //!< Minimum design coordinate of the axis
+        float         maximum{};      //!< Maximum design coordinate of the axis
+        float         defaultValue{}; //!< Default design coordinate of the axis
+    };
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Holds information about a named instance of a variable font
+    ///
+    ////////////////////////////////////////////////////////////
+    struct NamedInstance
+    {
+        std::string                                  name;        //!< Name of the instance (e.g. "Bold Italic")
+        std::vector<std::pair<std::uint32_t, float>> coordinates; //!< Axis tag to design coordinate mapping
+    };
+
     ////////////////////////////////////////////////////////////
     /// \brief Holds various information about a font
     ///
@@ -211,6 +242,142 @@ public:
     ///
     ////////////////////////////////////////////////////////////
     [[nodiscard]] const Info& getInfo() const;
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Tell whether or not the font is a variable font
+    ///
+    /// Variable fonts (TrueType GX or OpenType variation fonts) expose
+    /// one or more variation axes that can be adjusted through
+    /// `setVariableAxisValue`. Static fonts and bitmap fonts always
+    /// return `false`.
+    ///
+    /// \return `true` if the font has at least one variation axis
+    ///
+    /// \see `getVariableAxes`, `setVariableAxisValue`
+    ///
+    ////////////////////////////////////////////////////////////
+    [[nodiscard]] bool isVariableFont() const;
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Get the variation axes exposed by this font
+    ///
+    /// The returned vector is empty for fonts that are not variable.
+    /// Each axis reports its tag, name and the range of valid design
+    /// coordinates.
+    ///
+    /// \return The variation axes of the font
+    ///
+    /// \see `isVariableFont`, `getNamedInstances`
+    ///
+    ////////////////////////////////////////////////////////////
+    [[nodiscard]] const std::vector<VariableAxis>& getVariableAxes() const;
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Get the named instances stored in this font
+    ///
+    /// A named instance associates a name (such as "Condensed Bold")
+    /// with a full set of axis coordinates. The returned vector is
+    /// empty for fonts that are not variable or that define no named
+    /// instances.
+    ///
+    /// \return The named instances of the font
+    ///
+    /// \see `selectNamedInstance`
+    ///
+    ////////////////////////////////////////////////////////////
+    [[nodiscard]] const std::vector<NamedInstance>& getNamedInstances() const;
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Set the value of a variation axis using a tag string
+    ///
+    /// The axis label must be a four-character OpenType axis tag such
+    /// as "wght", "wdth" or "slnt". The value is a design coordinate
+    /// and gets clamped to the range reported by `getVariableAxes`.
+    /// Setting an axis only affects glyphs, metrics and textures that
+    /// are requested afterwards; glyphs cached for other axis values
+    /// are kept intact.
+    ///
+    /// \param tag   Four-character axis tag
+    /// \param value Design coordinate to apply
+    ///
+    /// \return `true` if the axis exists and the value was applied,
+    ///         `false` if the font is not loaded, is not variable,
+    ///         the tag is invalid or the axis does not exist
+    ///
+    /// \see `setVariableAxisValue(std::uint32_t, float)`,
+    ///      `resetVariableAxes`, `selectNamedInstance`
+    ///
+    ////////////////////////////////////////////////////////////
+    [[nodiscard]] bool setVariableAxisValue(std::string_view tag, float value);
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Set the value of a variation axis using a packed tag
+    ///
+    /// \param tag   Four-character axis tag packed as a 32-bit integer
+    /// \param value Design coordinate to apply (clamped to the axis range)
+    ///
+    /// \return `true` if the axis exists and the value was applied,
+    ///         `false` if the font is not loaded, is not variable
+    ///         or the axis does not exist
+    ///
+    /// \see `setVariableAxisValue(std::string_view, float)`,
+    ///      `resetVariableAxes`
+    ///
+    ////////////////////////////////////////////////////////////
+    [[nodiscard]] bool setVariableAxisValue(std::uint32_t tag, float value);
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Get the value currently assigned to a variation axis
+    ///
+    /// \param tag Four-character axis tag
+    ///
+    /// \return The current design coordinate, or `std::nullopt` if
+    ///         the tag is invalid or the axis does not exist
+    ///
+    ////////////////////////////////////////////////////////////
+    [[nodiscard]] std::optional<float> getVariableAxisValue(std::string_view tag) const;
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Select a named instance by its name
+    ///
+    /// All axis coordinates stored in the named instance are applied
+    /// together; coordinates of axes not covered by the instance are
+    /// reset to their default values.
+    ///
+    /// \param name Name of the instance as reported by
+    ///             `getNamedInstances`
+    ///
+    /// \return `true` if the instance exists and was applied,
+    ///         `false` otherwise (the previous axis values remain
+    ///         unchanged on failure)
+    ///
+    /// \see `getNamedInstances`, `setVariableAxisValue`
+    ///
+    ////////////////////////////////////////////////////////////
+    [[nodiscard]] bool selectNamedInstance(std::string_view name);
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Reset every variation axis to its default value
+    ///
+    /// After calling this function the font behaves exactly like a
+    /// static instance again. On fonts that are not variable this
+    /// function has no effect.
+    ///
+    /// \see `setVariableAxisValue`
+    ///
+    ////////////////////////////////////////////////////////////
+    void resetVariableAxes();
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Get the variation coordinates currently applied
+    ///
+    /// The entries are ordered by axis tag and only contain axes that
+    /// differ from their default value.
+    ///
+    /// \return A copy of the active axis tag/value pairs
+    ///
+    ////////////////////////////////////////////////////////////
+    [[nodiscard]] std::vector<std::pair<std::uint32_t, float>> getVariableAxisValues() const;
 
     ////////////////////////////////////////////////////////////
     /// \brief Retrieve a glyph of the font by glyph ID
@@ -466,6 +633,31 @@ private:
     using GlyphTable = std::unordered_map<std::uint64_t, Glyph>; //!< Table mapping a codepoint to its glyph
 
     ////////////////////////////////////////////////////////////
+    /// \brief Key identifying a set of glyph pages
+    ///
+    /// Glyphs cached at different character sizes or with different
+    /// variation axis values must never collide, so both are part
+    /// of the page key.
+    ///
+    ////////////////////////////////////////////////////////////
+    struct PageKey
+    {
+        unsigned int                                 characterSize{}; //!< Reference character size
+        std::vector<std::pair<std::uint32_t, float>> axisValues;      //!< Active variation axis values
+
+        [[nodiscard]] bool operator==(const PageKey& rhs) const;
+    };
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Hash functor for PageKey
+    ///
+    ////////////////////////////////////////////////////////////
+    struct PageKeyHash
+    {
+        [[nodiscard]] std::size_t operator()(const PageKey& key) const;
+    };
+
+    ////////////////////////////////////////////////////////////
     /// \brief Structure defining a page of glyphs
     ///
     ////////////////////////////////////////////////////////////
@@ -536,6 +728,33 @@ private:
     [[nodiscard]] bool setCurrentSize(unsigned int characterSize) const;
 
     ////////////////////////////////////////////////////////////
+    /// \brief Read the variation axes and named instances from the face
+    ///
+    ////////////////////////////////////////////////////////////
+    void loadVariableFontInfo();
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Make sure the FreeType face uses the current axis values
+    ///
+    ////////////////////////////////////////////////////////////
+    [[nodiscard]] bool applyAxisValues() const;
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Build the page key for the current axis values
+    ///
+    ////////////////////////////////////////////////////////////
+    [[nodiscard]] PageKey makePageKey(unsigned int characterSize) const;
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Get the active axis values as tag/value pairs for shaping
+    ///
+    /// This is used internally by Text so that HarfBuzz shaping takes
+    /// the same variation coordinates into account as glyph rasterization.
+    ///
+    ////////////////////////////////////////////////////////////
+    [[nodiscard]] std::vector<std::pair<std::uint32_t, float>> getAxisVariationsForShaping() const;
+
+    ////////////////////////////////////////////////////////////
     /// Handle
     ////////////////////////////////////////////////////////////
     using FontHandle = void*; //!< Font handle used by the shaper
@@ -557,7 +776,7 @@ private:
     // Types
     ////////////////////////////////////////////////////////////
     struct FontHandles;
-    using PageTable = std::unordered_map<unsigned int, Page>; //!< Table mapping a character size to its page (texture)
+    using PageTable = std::unordered_map<PageKey, Page, PageKeyHash>; //!< Table mapping a size/axis combination to its page (texture)
 
     ////////////////////////////////////////////////////////////
     // Member data
@@ -565,9 +784,35 @@ private:
     std::shared_ptr<FontHandles> m_fontHandles;    //!< Shared information about the internal font instance
     bool                         m_isSmooth{true}; //!< Status of the smooth filter
     Info                         m_info;           //!< Information about the font
-    mutable PageTable            m_pages;          //!< Table containing the glyphs pages by character size
+    mutable PageTable            m_pages;          //!< Table containing the glyphs pages by size and axis values
     mutable std::vector<std::uint8_t> m_pixelBuffer; //!< Pixel buffer holding a glyph's pixels before being written to the texture
-    std::shared_ptr<InputStream> m_stream; //!< Stream for openFromFile and openFromMemory
+    std::shared_ptr<InputStream>                 m_stream;         //!< Stream for openFromFile and openFromMemory
+    std::vector<VariableAxis>                    m_variableAxes;   //!< Variation axes exposed by the font
+    std::vector<NamedInstance>                   m_namedInstances; //!< Named instances exposed by the font
+    std::vector<std::pair<std::uint32_t, float>> m_axisValues;     //!< Currently applied axis values (non-default only)
+    mutable bool m_axisValuesApplied{true};                        //!< Whether the face already uses m_axisValues
+    mutable bool m_sizeMetricsDirty{false}; //!< Whether the active size predates the last axis change
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Default global metrics captured before any axis is set
+    ///
+    /// FreeType does not always restore MVAR-derived hhea metrics when
+    /// the default coordinates are selected again, so the values are
+    /// snapshotted at load time and reused whenever no axis deviates
+    /// from its default. This keeps output bit-identical for fonts
+    /// whose axes were never (or no longer) customized.
+    ///
+    ////////////////////////////////////////////////////////////
+    struct DefaultMetrics
+    {
+        long  ascender{};           //!< Default hhea ascender, in font units
+        long  descender{};          //!< Default hhea descender, in font units
+        long  height{};             //!< Default hhea line height, in font units
+        short underlinePosition{};  //!< Default underline position, in font units
+        short underlineThickness{}; //!< Default underline thickness, in font units
+        bool  valid{};              //!< Whether the snapshot was taken
+    };
+    DefaultMetrics m_defaultMetrics; //!< Metrics of the unmodified default instance
 };
 
 } // namespace sf

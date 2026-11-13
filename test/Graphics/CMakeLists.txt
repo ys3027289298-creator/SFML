@@ -7,6 +7,7 @@ set(GRAPHICS_SRC
     CoordinateType.test.cpp
     Drawable.test.cpp
     Font.test.cpp
+    FontVariable.test.cpp
     Glsl.test.cpp
     Glyph.test.cpp
     Image.test.cpp
@@ -53,6 +54,8 @@ if (XCODE AND SFML_OS_IOS)
         shader.frag
         shader.geom
         shader.vert
+        sfml-static.ttf
+        sfml-variable.ttf
         tuffy-🐌.ttf
         tuffy-ń.ttf
         tuffy.ttf

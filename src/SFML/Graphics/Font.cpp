@@ -43,8 +43,12 @@
 #include FT_OUTLINE_H
 #include FT_BITMAP_H
 #include FT_STROKER_H
+#include FT_MULTIPLE_MASTERS_H
+#include FT_SFNT_NAMES_H
 
+#include <algorithm>
 #include <atomic>
+#include <functional>
 #include <ostream>
 #include <utility>
 
@@ -93,6 +97,99 @@ std::uint64_t getUniqueId() noexcept
     static std::atomic<std::uint64_t> id(1); // start at 1, zero is "no font"
 
     return id.fetch_add(1);
+}
+
+// Convert a four-character axis label into its packed 32-bit tag.
+// Returns false if the label does not contain exactly four ASCII characters.
+bool tagFromString(std::string_view tag, std::uint32_t& result)
+{
+    if (tag.size() != 4)
+        return false;
+
+    result = 0;
+    for (char character : tag)
+    {
+        const auto unsignedCharacter = static_cast<unsigned char>(character);
+        if (unsignedCharacter < 0x20 || unsignedCharacter > 0x7E)
+            return false;
+        result = (result << 8) | unsignedCharacter;
+    }
+
+    return true;
+}
+
+// Convert a packed 32-bit axis tag back into a four-character label
+std::string tagToString(std::uint32_t tag)
+{
+    return {static_cast<char>((tag >> 24) & 0xFF),
+            static_cast<char>((tag >> 16) & 0xFF),
+            static_cast<char>((tag >> 8) & 0xFF),
+            static_cast<char>(tag & 0xFF)};
+}
+
+// Resolve a 'name' table entry of the face into a UTF-8 string.
+// Prefers the Unicode platforms and falls back to the first available
+// record with a matching name ID. Returns an empty string on failure.
+std::string getNameString(FT_Face face, FT_UInt nameId)
+{
+    const FT_UInt count = FT_Get_Sfnt_Name_Count(face);
+
+    FT_SfntName best{};
+    bool        found = false;
+    for (FT_UInt i = 0; i < count; ++i)
+    {
+        FT_SfntName record;
+        if (FT_Get_Sfnt_Name(face, i, &record) != FT_Err_Ok || record.name_id != nameId)
+            continue;
+
+        // Windows Unicode (3,1) and Unicode (0,*) records are directly usable
+        const bool isWindowsUnicode = record.platform_id == 3 && record.encoding_id == 1;
+        const bool isUnicode        = record.platform_id == 0;
+        if (isWindowsUnicode || isUnicode)
+        {
+            best  = record;
+            found = true;
+            if (isWindowsUnicode)
+                break;
+        }
+        else if (!found)
+        {
+            best  = record;
+            found = true;
+        }
+    }
+
+    if (!found || best.string_len == 0)
+        return {};
+
+    // UTF-16BE records (Windows Unicode / platform 0) need decoding
+    const bool isUtf16 = (best.platform_id == 3 && best.encoding_id == 1) || best.platform_id == 0;
+    if (!isUtf16)
+        return {reinterpret_cast<const char*>(best.string), best.string_len};
+
+    std::string result;
+    result.reserve(best.string_len / 2);
+    for (FT_UInt i = 0; i + 1 < best.string_len; i += 2)
+    {
+        const char32_t codePoint = static_cast<char32_t>((best.string[i] << 8) | best.string[i + 1]);
+
+        if (codePoint < 0x80)
+        {
+            result.push_back(static_cast<char>(codePoint));
+        }
+        else if (codePoint < 0x800)
+        {
+            result.push_back(static_cast<char>(0xC0 | (codePoint >> 6)));
+            result.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+        }
+        else
+        {
+            result.push_back(static_cast<char>(0xE0 | (codePoint >> 12)));
+            result.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+            result.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+        }
+    }
+    return result;
 }
 } // namespace
 
@@ -241,8 +338,179 @@ const Font::Info& Font::getInfo() const
 
 
 ////////////////////////////////////////////////////////////
+bool Font::isVariableFont() const
+{
+    return !m_variableAxes.empty();
+}
+
+
+////////////////////////////////////////////////////////////
+const std::vector<Font::VariableAxis>& Font::getVariableAxes() const
+{
+    return m_variableAxes;
+}
+
+
+////////////////////////////////////////////////////////////
+const std::vector<Font::NamedInstance>& Font::getNamedInstances() const
+{
+    return m_namedInstances;
+}
+
+
+////////////////////////////////////////////////////////////
+bool Font::setVariableAxisValue(std::string_view tag, float value)
+{
+    std::uint32_t packedTag = 0;
+    if (!tagFromString(tag, packedTag))
+    {
+        err() << "Failed to set variation axis value (axis tag \"" << tag
+              << "\" is invalid, expected a four-character label such as \"wght\")" << std::endl;
+        return false;
+    }
+
+    return setVariableAxisValue(packedTag, value);
+}
+
+
+////////////////////////////////////////////////////////////
+bool Font::setVariableAxisValue(std::uint32_t tag, float value)
+{
+    if (!m_fontHandles || m_variableAxes.empty())
+    {
+        err() << "Failed to set variation axis value (font is not loaded or is not a variable font)" << std::endl;
+        return false;
+    }
+
+    const auto axisIt = std::find_if(m_variableAxes.begin(),
+                                     m_variableAxes.end(),
+                                     [tag](const VariableAxis& axis) { return axis.tag == tag; });
+    if (axisIt == m_variableAxes.end())
+    {
+        err() << "Failed to set variation axis value (axis \"" << tagToString(tag) << "\" does not exist in font \""
+              << m_info.family << "\")" << std::endl;
+        return false;
+    }
+
+    // Clamp the requested value to the axis range
+    const float clampedValue = std::clamp(value, axisIt->minimum, axisIt->maximum);
+    if (clampedValue != value)
+    {
+        err() << "Variation axis value " << value << " for axis \"" << tagToString(tag) << "\" is out of range ["
+              << axisIt->minimum << ", " << axisIt->maximum << "], clamping to " << clampedValue << std::endl;
+    }
+
+    const auto valueIt = std::find_if(m_axisValues.begin(),
+                                      m_axisValues.end(),
+                                      [tag](const std::pair<std::uint32_t, float>& entry) { return entry.first == tag; });
+
+    // Assigning the default value removes the override entirely so the
+    // font converges back to the single empty-axis cache key
+    if (clampedValue == axisIt->defaultValue)
+    {
+        if (valueIt != m_axisValues.end())
+            m_axisValues.erase(valueIt);
+    }
+    else if (valueIt == m_axisValues.end())
+        m_axisValues.emplace_back(tag, clampedValue);
+    else
+        valueIt->second = clampedValue;
+
+    // Keep the entries sorted by tag so cache keys stay comparable
+    std::sort(m_axisValues.begin(), m_axisValues.end());
+
+    m_axisValuesApplied = false;
+    return true;
+}
+
+
+////////////////////////////////////////////////////////////
+std::optional<float> Font::getVariableAxisValue(std::string_view tag) const
+{
+    std::uint32_t packedTag = 0;
+    if (!tagFromString(tag, packedTag))
+        return std::nullopt;
+
+    const auto axisIt = std::find_if(m_variableAxes.begin(),
+                                     m_variableAxes.end(),
+                                     [packedTag](const VariableAxis& axis) { return axis.tag == packedTag; });
+    if (axisIt == m_variableAxes.end())
+        return std::nullopt;
+
+    const auto valueIt = std::find_if(m_axisValues.begin(),
+                                      m_axisValues.end(),
+                                      [packedTag](const std::pair<std::uint32_t, float>& entry)
+                                      { return entry.first == packedTag; });
+    if (valueIt != m_axisValues.end())
+        return valueIt->second;
+
+    return axisIt->defaultValue;
+}
+
+
+////////////////////////////////////////////////////////////
+bool Font::selectNamedInstance(std::string_view name)
+{
+    const auto instanceIt = std::find_if(m_namedInstances.begin(),
+                                         m_namedInstances.end(),
+                                         [name](const NamedInstance& instance) { return instance.name == name; });
+    if (instanceIt == m_namedInstances.end())
+    {
+        err() << "Failed to select named instance \"" << name << "\" (no instance with that name in font \""
+              << m_info.family << "\")" << std::endl;
+        return false;
+    }
+
+    // Rebuild the coordinate set from scratch so axes which are not
+    // covered by the instance fall back to their default values. Values
+    // that match an axis default are dropped on purpose: m_axisValues only
+    // stores non-default coordinates so the reset state keeps a stable,
+    // empty cache key.
+    std::vector<std::pair<std::uint32_t, float>> newValues;
+    for (const auto& [tag, coordinate] : instanceIt->coordinates)
+    {
+        const auto axisIt = std::find_if(m_variableAxes.begin(),
+                                         m_variableAxes.end(),
+                                         [tag](const VariableAxis& axis) { return axis.tag == tag; });
+        if (axisIt != m_variableAxes.end() && coordinate != axisIt->defaultValue)
+            newValues.emplace_back(tag, coordinate);
+    }
+    std::sort(newValues.begin(), newValues.end());
+
+    m_axisValues        = std::move(newValues);
+    m_axisValuesApplied = false;
+    return true;
+}
+
+
+////////////////////////////////////////////////////////////
+void Font::resetVariableAxes()
+{
+    if (m_axisValues.empty())
+        return;
+
+    m_axisValues.clear();
+    m_axisValuesApplied = false;
+}
+
+
+////////////////////////////////////////////////////////////
+std::vector<std::pair<std::uint32_t, float>> Font::getVariableAxisValues() const
+{
+    return m_axisValues;
+}
+
+
+////////////////////////////////////////////////////////////
 const Glyph& Font::getGlyphById(std::uint32_t id, unsigned int characterSize, bool bold, float outlineThickness) const
 {
+    // Make sure the face currently matches the requested axis values
+    if (!applyAxisValues())
+    {
+        static const Glyph emptyGlyph;
+        return emptyGlyph;
+    }
+
     // Get the page corresponding to the character size
     GlyphTable& glyphs = loadPage(characterSize).glyphs;
 
@@ -295,7 +563,7 @@ float Font::getKerning(char32_t first, char32_t second, unsigned int characterSi
 
     FT_Face face = m_fontHandles ? m_fontHandles->face : nullptr;
 
-    if (face && setCurrentSize(characterSize))
+    if (face && applyAxisValues() && setCurrentSize(characterSize))
     {
         // Convert the characters to indices
         const FT_UInt index1 = FT_Get_Char_Index(face, first);
@@ -329,10 +597,13 @@ float Font::getAscent(unsigned int characterSize) const
 {
     FT_Face face = m_fontHandles ? m_fontHandles->face : nullptr;
 
-    if (face && setCurrentSize(characterSize))
+    if (face && applyAxisValues() && setCurrentSize(characterSize))
     {
         if (!FT_IS_SCALABLE(face))
             return static_cast<float>(face->size->metrics.ascender) / float{1 << 6};
+
+        if (m_axisValues.empty() && m_defaultMetrics.valid && !m_variableAxes.empty())
+            return static_cast<float>(FT_MulFix(m_defaultMetrics.ascender, face->size->metrics.y_scale)) / float{1 << 6};
 
         return static_cast<float>(FT_MulFix(face->ascender, face->size->metrics.y_scale)) / float{1 << 6};
     }
@@ -346,10 +617,13 @@ float Font::getDescent(unsigned int characterSize) const
 {
     FT_Face face = m_fontHandles ? m_fontHandles->face : nullptr;
 
-    if (face && setCurrentSize(characterSize))
+    if (face && applyAxisValues() && setCurrentSize(characterSize))
     {
         if (!FT_IS_SCALABLE(face))
             return static_cast<float>(face->size->metrics.descender) / float{1 << 6};
+
+        if (m_axisValues.empty() && m_defaultMetrics.valid && !m_variableAxes.empty())
+            return static_cast<float>(FT_MulFix(m_defaultMetrics.descender, face->size->metrics.y_scale)) / float{1 << 6};
 
         return static_cast<float>(FT_MulFix(face->descender, face->size->metrics.y_scale)) / float{1 << 6};
     }
@@ -363,8 +637,11 @@ float Font::getLineSpacing(unsigned int characterSize) const
 {
     FT_Face face = m_fontHandles ? m_fontHandles->face : nullptr;
 
-    if (face && setCurrentSize(characterSize))
+    if (face && applyAxisValues() && setCurrentSize(characterSize))
     {
+        if (m_axisValues.empty() && m_defaultMetrics.valid && !m_variableAxes.empty())
+            return static_cast<float>(FT_MulFix(m_defaultMetrics.height, face->size->metrics.y_scale)) / float{1 << 6};
+
         return static_cast<float>(face->size->metrics.height) / float{1 << 6};
     }
 
@@ -377,11 +654,15 @@ float Font::getUnderlinePosition(unsigned int characterSize) const
 {
     FT_Face face = m_fontHandles ? m_fontHandles->face : nullptr;
 
-    if (face && setCurrentSize(characterSize))
+    if (face && applyAxisValues() && setCurrentSize(characterSize))
     {
         // Return a fixed position if font is a bitmap font
         if (!FT_IS_SCALABLE(face))
             return static_cast<float>(characterSize) / 10.f;
+
+        if (m_axisValues.empty() && m_defaultMetrics.valid && !m_variableAxes.empty())
+            return -static_cast<float>(FT_MulFix(m_defaultMetrics.underlinePosition, face->size->metrics.y_scale)) /
+                   float{1 << 6};
 
         return -static_cast<float>(FT_MulFix(face->underline_position, face->size->metrics.y_scale)) / float{1 << 6};
     }
@@ -395,11 +676,15 @@ float Font::getUnderlineThickness(unsigned int characterSize) const
 {
     FT_Face face = m_fontHandles ? m_fontHandles->face : nullptr;
 
-    if (face && setCurrentSize(characterSize))
+    if (face && applyAxisValues() && setCurrentSize(characterSize))
     {
         // Return a fixed thickness if font is a bitmap font
         if (!FT_IS_SCALABLE(face))
             return static_cast<float>(characterSize) / 14.f;
+
+        if (m_axisValues.empty() && m_defaultMetrics.valid && !m_variableAxes.empty())
+            return static_cast<float>(FT_MulFix(m_defaultMetrics.underlineThickness, face->size->metrics.y_scale)) /
+                   float{1 << 6};
 
         return static_cast<float>(FT_MulFix(face->underline_thickness, face->size->metrics.y_scale)) / float{1 << 6};
     }
@@ -411,6 +696,7 @@ float Font::getUnderlineThickness(unsigned int characterSize) const
 ////////////////////////////////////////////////////////////
 const Texture& Font::getTexture(unsigned int characterSize) const
 {
+    static_cast<void>(applyAxisValues());
     return loadPage(characterSize).texture;
 }
 
@@ -447,6 +733,13 @@ void Font::cleanup()
 
     // Drop the file stream if we held one due to openFromFile or openFromMemory
     m_stream.reset();
+
+    // Reset variation state
+    m_variableAxes.clear();
+    m_namedInstances.clear();
+    m_axisValues.clear();
+    m_axisValuesApplied = true;
+    m_sizeMetricsDirty  = false;
 }
 
 
@@ -513,6 +806,20 @@ bool Font::openFromStreamImpl(InputStream& stream, std::string_view type)
     m_info.hasKerning         = FT_HAS_KERNING(face);
     m_info.hasVerticalMetrics = FT_HAS_VERTICAL(face);
 
+    // Snapshot the metrics of the untouched default instance. FreeType does
+    // not reliably restore MVAR-derived hhea metrics after variation
+    // coordinates were set and cleared again, so we reuse this snapshot
+    // whenever the font is back on its default axis values.
+    m_defaultMetrics.ascender           = face->ascender;
+    m_defaultMetrics.descender          = face->descender;
+    m_defaultMetrics.height             = face->height;
+    m_defaultMetrics.underlinePosition  = face->underline_position;
+    m_defaultMetrics.underlineThickness = face->underline_thickness;
+    m_defaultMetrics.valid              = true;
+
+    // Enumerate variation axes and named instances (no-op for static fonts)
+    loadVariableFontInfo();
+
     return true;
 }
 
@@ -520,7 +827,169 @@ bool Font::openFromStreamImpl(InputStream& stream, std::string_view type)
 ////////////////////////////////////////////////////////////
 Font::Page& Font::loadPage(unsigned int characterSize) const
 {
-    return m_pages.try_emplace(characterSize, m_isSmooth).first->second;
+    return m_pages.try_emplace(makePageKey(characterSize), m_isSmooth).first->second;
+}
+
+
+////////////////////////////////////////////////////////////
+void Font::loadVariableFontInfo()
+{
+    m_variableAxes.clear();
+    m_namedInstances.clear();
+    m_axisValues.clear();
+    m_axisValuesApplied = true;
+    m_sizeMetricsDirty  = false;
+
+    FT_Face face = m_fontHandles ? m_fontHandles->face : nullptr;
+    if (!face || !FT_HAS_MULTIPLE_MASTERS(face))
+        return;
+
+    FT_MM_Var* mmVar = nullptr;
+    if (FT_Get_MM_Var(face, &mmVar) != 0 || !mmVar)
+    {
+        err() << "Failed to query variation axes of font \"" << m_info.family << "\"" << std::endl;
+        return;
+    }
+
+    // FreeType guarantees that FT_Get_MM_Var succeeds for any face that
+    // reports the multiple masters flag, but keep the guard for safety.
+    struct MmVarDeleter
+    {
+        FT_Library library;
+        void       operator()(FT_MM_Var* pointer) const
+        {
+            if (pointer)
+                FT_Done_MM_Var(library, pointer);
+        }
+    };
+    const std::unique_ptr<FT_MM_Var, MmVarDeleter> holder(mmVar, MmVarDeleter{m_fontHandles->library});
+
+    m_variableAxes.reserve(mmVar->num_axis);
+    for (FT_UInt i = 0; i < mmVar->num_axis; ++i)
+    {
+        const FT_Var_Axis& ftAxis = mmVar->axis[i];
+
+        VariableAxis axis;
+        axis.tag          = static_cast<std::uint32_t>(ftAxis.tag);
+        axis.name         = ftAxis.name ? ftAxis.name : tagToString(static_cast<std::uint32_t>(ftAxis.tag));
+        axis.minimum      = static_cast<float>(ftAxis.minimum) / float{1 << 16};
+        axis.maximum      = static_cast<float>(ftAxis.maximum) / float{1 << 16};
+        axis.defaultValue = static_cast<float>(ftAxis.def) / float{1 << 16};
+        m_variableAxes.push_back(std::move(axis));
+    }
+
+    m_namedInstances.reserve(mmVar->num_namedstyles);
+    for (FT_UInt i = 0; i < mmVar->num_namedstyles; ++i)
+    {
+        const FT_Var_Named_Style& ftStyle = mmVar->namedstyle[i];
+
+        NamedInstance instance;
+        instance.name = getNameString(face, ftStyle.strid);
+        if (instance.name.empty())
+            instance.name = "Instance " + std::to_string(i);
+
+        instance.coordinates.reserve(mmVar->num_axis);
+        for (FT_UInt axisIndex = 0; axisIndex < mmVar->num_axis; ++axisIndex)
+        {
+            const float coordinate = static_cast<float>(ftStyle.coords[axisIndex]) / float{1 << 16};
+            instance.coordinates.emplace_back(mmVar->axis[axisIndex].tag, coordinate);
+        }
+        std::sort(instance.coordinates.begin(), instance.coordinates.end());
+        m_namedInstances.push_back(std::move(instance));
+    }
+}
+
+
+////////////////////////////////////////////////////////////
+bool Font::applyAxisValues() const
+{
+    if (m_axisValuesApplied)
+        return true;
+
+    if (!m_fontHandles || !m_fontHandles->face)
+        return false;
+
+    FT_Face face = m_fontHandles->face;
+
+    // Nothing applied yet: reset the face to its default instance so that
+    // a previously selected variation cannot leak into the new state.
+    if (m_axisValues.empty())
+    {
+        if (FT_Set_Named_Instance(face, 0) != FT_Err_Ok)
+        {
+            err() << "Failed to reset variation axes of font \"" << m_info.family << "\"" << std::endl;
+            return false;
+        }
+
+        m_axisValuesApplied = true;
+        m_sizeMetricsDirty  = true;
+        return true;
+    }
+
+    std::vector<FT_Fixed> coordinates;
+    coordinates.reserve(m_variableAxes.size());
+
+    // Start from the default coordinate of every axis, then override the
+    // axes the user explicitly assigned a value to.
+    for (const VariableAxis& axis : m_variableAxes)
+    {
+        const auto  valueIt = std::find_if(m_axisValues.begin(),
+                                          m_axisValues.end(),
+                                          [&axis](const std::pair<std::uint32_t, float>& entry)
+                                          { return entry.first == axis.tag; });
+        const float value   = (valueIt != m_axisValues.end()) ? valueIt->second : axis.defaultValue;
+        coordinates.push_back(static_cast<FT_Fixed>(std::llround(value * float{1 << 16})));
+    }
+
+    const FT_Error error = FT_Set_Var_Design_Coordinates(face, static_cast<FT_UInt>(coordinates.size()), coordinates.data());
+    if (error != FT_Err_Ok)
+    {
+        err() << "Failed to set variation coordinates of font \"" << m_info.family << "\"" << std::endl;
+        return false;
+    }
+
+    m_axisValuesApplied = true;
+    m_sizeMetricsDirty  = true;
+    return true;
+}
+
+
+////////////////////////////////////////////////////////////
+Font::PageKey Font::makePageKey(unsigned int characterSize) const
+{
+    return PageKey{characterSize, m_axisValues};
+}
+
+
+////////////////////////////////////////////////////////////
+std::vector<std::pair<std::uint32_t, float>> Font::getAxisVariationsForShaping() const
+{
+    // Make sure a newly created HarfBuzz font observes the same face state
+    static_cast<void>(applyAxisValues());
+    return m_axisValues;
+}
+
+
+////////////////////////////////////////////////////////////
+bool Font::PageKey::operator==(const PageKey& rhs) const
+{
+    return characterSize == rhs.characterSize && axisValues == rhs.axisValues;
+}
+
+
+////////////////////////////////////////////////////////////
+std::size_t Font::PageKeyHash::operator()(const PageKey& key) const
+{
+    std::size_t seed = std::hash<unsigned int>{}(key.characterSize);
+    for (const auto& [tag, value] : key.axisValues)
+    {
+        // Reinterpret the float bits so identical values hash identically
+        std::uint32_t valueBits = 0;
+        std::memcpy(&valueBits, &value, sizeof(valueBits));
+        seed ^= std::hash<std::uint32_t>{}(tag) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        seed ^= std::hash<std::uint32_t>{}(valueBits) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    }
+    return seed;
 }
 
 
@@ -772,9 +1241,15 @@ bool Font::setCurrentSize(unsigned int characterSize) const
     FT_Face         face        = m_fontHandles->face;
     const FT_UShort currentSize = face->size->metrics.x_ppem;
 
-    if (currentSize != characterSize)
+    // FreeType only recomputes MVAR-derived size metrics when
+    // FT_Set_Pixel_Sizes is called. After variation coordinates changed we
+    // therefore force a refresh even if the requested ppem is already
+    // active, so line spacing and friends observe the new axis values.
+    if (currentSize != characterSize || m_sizeMetricsDirty)
     {
         const FT_Error result = FT_Set_Pixel_Sizes(face, 0, characterSize);
+        if (result == FT_Err_Ok)
+            m_sizeMetricsDirty = false;
 
         if (result == FT_Err_Invalid_Pixel_Size)
         {
